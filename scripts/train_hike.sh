@@ -16,11 +16,12 @@ function rand(){
 ulimit -n 4096
 port=$(rand 10000 30000)
 
-scene=("forest1" "forest2" "forest3" "garden1" "garden2" "garden3" "indoor" "playground" "university1" "university2" "university3" "university4")
+# scene=("forest1" "forest2" "forest3" "garden1" "garden2" "garden3" "indoor" "playground" "university1" "university2" "university3" "university4")
+scene=("forest1" "forest2" "university2")
 
 for scene in "${scene[@]}"; do
     timestamp=$(date "+%Y-%m-%d_%H:%M:%S")
-    python train.py --eval -s ./data/hike/$scene -m outputs/hike/$scene/"$timestamp" -r 4 --port $port --mode hike
+    python train.py --eval -s /home/zhanqh/dataset/city/StaticHikes/$scene -m outputs/hike/$scene/"$timestamp" -r 4 --port $port --mode hike
     python render.py -m outputs/hike/$scene/"$timestamp"
     python metrics.py -m outputs/hike/$scene/"$timestamp"
 done
