@@ -20,23 +20,20 @@ import json
 from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
-import subprocess
-import numpy as np
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+import traceback
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {DEVICE}")
 
 def readImages(renders_dir, gt_dir):
     renders = []
     gts = []
     image_names = []
-    for fname in os.listdir(renders_dir):
+    for fname in sorted(os.listdir(renders_dir)):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].to(DEVICE))
+        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].to(DEVICE))
         image_names.append(fname)
     return renders, gts, image_names
 
@@ -96,8 +93,9 @@ def evaluate(model_paths):
                 json.dump(full_dict[scene_dir], fp, indent=True)
             with open(scene_dir + "/per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception:
             print("Unable to compute metrics for model", scene_dir)
+            traceback.print_exc()
 
 if __name__ == "__main__":
     
