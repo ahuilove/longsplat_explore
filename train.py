@@ -70,6 +70,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
+    # 在场景初始化的过程当中就会通过mast3r进行初始点云构建  
+    # 初始化图片的数目受init_frame_num的影响  默认设置为3张
     scene = Scene(dataset, gaussians)
     num_views = len(scene.getTrainCameras())
     start_view_id = 0
@@ -106,6 +108,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
         # Pick a random Camera
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras()[0:end_view_id]
+        # pop(...) 把这个相机取出来，并从 viewpoint_stack 里删除 因此是一种无放回随机采样
         viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
 
         # Render
@@ -193,15 +196,23 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
 
     end_view_id += 1
 
+    # 如果到这结束 就是Scaffold-GS 风格 anchor Gaussian 优化  以及densification过程   只是多了损失和相机优化
+
     # PnP retry limit to avoid infinite loop
+    # pnp最多重复10次
     pnp_retry_count = {}
     max_pnp_retries = 10
 
+    # 这个循环就是最核心的 增量式重建循环
+    # start_view_id 当前窗口起点  end_view_id  当前窗口终点(右开区间)  num_views  训练集总帧数   end_view_id - 1 是要加入的新帧
+  
     while start_view_id < num_views:
         ## pose estimation ##
         opt.iterations = local_iter
         opt.update_until = local_iter
+        # 为当前窗口重新设置optimizer   准备local optimization
         gaussians.training_setup(opt)
+        # 取出当前窗口的相机
         gaussians.training_pose_setup(scene.getTrainCameras()[start_view_id:end_view_id] ,opt)
 
         viewpoint_stack = None
@@ -212,9 +223,11 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 pre_viewpoint_cam1 = scene.getTrainCameras()[end_view_id-2]
                 viewpoint_cam = scene.getTrainCameras()[end_view_id-1]
 
+                # 用当前训练好的高斯渲染前一帧的深度
                 pre_render_pkg = render(pre_viewpoint_cam1, gaussians, pipe, background, retain_grad=False)
                 pre_rendered_depth = pre_render_pkg["depth"][0]
 
+                # 利用mast3r将前一帧的深度和当前帧的图像进行匹配  得到关键点kp0 kp1 以及深度图
                 intrinsic_np = viewpoint_cam.intrinsic.detach().cpu().numpy()
                 viewpoint_cam.kp0, viewpoint_cam.kp1, _, _, _, _, _, _, viewpoint_cam.pre_depth_map, viewpoint_cam.depth_map = matcher._forward(pre_viewpoint_cam1.original_image, viewpoint_cam.original_image, intrinsic_np)
                 viewpoint_cam.conf = torch.ones(viewpoint_cam.kp0.shape[0], device=viewpoint_cam.kp0.device)
@@ -223,6 +236,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 viewpoint_cam.depth_map = viewpoint_cam.depth_map.cuda()
                 viewpoint_cam.pre_depth_map = viewpoint_cam.pre_depth_map.cuda()
 
+                # 用前一帧的渲染深度将kp0投影成3d点
                 pre_pts = unporject(pre_rendered_depth, pre_viewpoint_cam1.view_world_transform, pre_viewpoint_cam1.intrinsic, viewpoint_cam.kp0)
                 
                 kp1 = viewpoint_cam.kp1 / 2 + .5
@@ -231,6 +245,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 pre_pts_np = pre_pts.detach().cpu().numpy()
                 kp1_np = kp1.detach().cpu().numpy()
 
+                # 用前一帧得到的三维点和两张图的关键点匹配 solvepnp计算当前帧的相机位姿 
                 success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(pre_pts_np, kp1_np, intrinsic_np, None, iterationsCount=200,reprojectionError=5.0,confidence=0.99, flags=cv2.SOLVEPNP_ITERATIVE)
 
                 if success and len(inliers) >= 4:
@@ -238,6 +253,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     kp1_inliers = kp1_np[inliers].reshape(-1, 2)
 
                     initial_params = np.hstack((rotation_vector.flatten(), translation_vector.flatten()))
+                    # pnp得到的初值再用重投影误差做一次非线性优化
                     result = least_squares(reprojection_error, initial_params, 
                                         args=(pre_pts_inliers, kp1_inliers, intrinsic_np),
                                         verbose=0,  # Verbose mode to print loss
@@ -258,6 +274,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     else:
                         end_view_id -= 1
 
+                # 将新帧的相机位姿进行注册
                 rotation_matrix, _ = cv2.Rodrigues(-rotation_vector)
                 translation_vector = translation_vector.reshape(3)
                 rotation_matrix = torch.from_numpy(rotation_matrix).float().cuda()
@@ -265,9 +282,11 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 
                 viewpoint_cam.update_RT(rotation_matrix, translation_vector)
 
+                # mast3r估计的深度尺度和当前尺度可能不一致  因此需要估计一个线性变换
                 scale, offset = compute_scale(pre_rendered_depth, viewpoint_cam.pre_depth_map, viewpoint_cam.kp0)
                 viewpoint_cam.depth_map = viewpoint_cam.depth_map * scale + offset
                 
+            # pnp后  还会只优化新帧的pose delta
             pose_optimizer = torch.optim.Adam([{"params": [viewpoint_cam.cam_trans_delta], "lr": opt.translation_lr_init}, {"params": [viewpoint_cam.cam_rot_delta], "lr": opt.rotation_lr_init}])
             gt_image = viewpoint_cam.original_image.cuda()
             
@@ -277,6 +296,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                 image = render_pkg["render"]
                 rendered_depth = render_pkg["depth"][0]
                 voxel_visible_mask = render_pkg["visible_mask"]
+                # 前一帧投影到新帧后的可见区域  用这里更加可靠
                 occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
 
                 Ll1 = l1_loss(image[:,occ_mask], gt_image[:,occ_mask])
@@ -310,6 +330,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
             
             progress_bar.close()
 
+            # 找出新出现的区域  使用估计的深度在这些的地方进行densification
             with torch.no_grad():
                 occ_mask = get_occlusion_mask(viewpoint_cam=pre_viewpoint_cam1, viewpoint_cam2=viewpoint_cam, depth=pre_rendered_depth, device=pre_rendered_depth.device, thresh=0.001).detach()
                 densify_mask = occ_mask.view(-1) == 0
@@ -318,6 +339,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     gaussians.densify_occlusion(viewpoint_cam, depth_ref, densify_mask)
         
         ## local optimization ##
+        # 只采样局部窗口内的相机
         first_iter = 0
         progress_bar = tqdm(range(first_iter, opt.iterations), desc="Local Optimization " + str(end_view_id) + "/" + str(num_views) + "(w=" + str(end_view_id-start_view_id) + ")")
         first_iter += 1
@@ -421,6 +443,8 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     gaussians.pose_optimizer.zero_grad(set_to_none = True)
                     update_pose(viewpoint_cam)
         
+        ## global optimization ##
+        # 将已经注册的所有帧进行优化
         opt.iterations = global_iter
         opt.update_until = global_iter
         gaussians.training_setup(opt)
@@ -532,6 +556,7 @@ def training(dataset, opt, pipe, dataset_name, debug_from, logger=None):
                     gaussians.pose_optimizer.zero_grad(set_to_none = True)
                     update_pose(viewpoint_cam)
 
+        # 更新滑动窗口
         with torch.no_grad():
             if end_view_id < num_views:
                 end_viewpoint_cam = scene.getTrainCameras()[end_view_id - 1]

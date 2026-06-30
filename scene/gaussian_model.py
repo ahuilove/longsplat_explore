@@ -86,7 +86,7 @@ class GaussianModel:
         self.offset_gradient_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
 
-        self.anchor_demon = torch.empty(0)
+        self.anchor_denom = torch.empty(0)
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -388,13 +388,18 @@ class GaussianModel:
 
 
     def training_setup(self, training_args):
+        # 保留参数 / 兼容原版3DGS接口
         self.percent_dense = training_args.percent_dense
 
+        # [num_anchors, 1] 作用：统计每个 anchor 在一段训练窗口内累积的 opacity
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
+        # [num_anchors * n_offsets, 1]  作用：累计每个 offset Gaussian 在屏幕空间的梯度大小
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
+        # [num_anchors * n_offsets, 1] 作用：统计每个 offset 的梯度累计次数
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
-        self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        # [num_anchors, 1] 作用：统计每个 anchor 被访问/可见了多少次
+        self.anchor_denom = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
         
         
@@ -748,7 +753,7 @@ class GaussianModel:
         self.opacity_accum[anchor_visible_mask] += temp_opacity.sum(dim=1, keepdim=True)
         
         # update anchor visiting statis
-        self.anchor_demon[anchor_visible_mask] += 1
+        self.anchor_denom[anchor_visible_mask] += 1
 
         # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1)
@@ -900,9 +905,9 @@ class GaussianModel:
                 }
                 
 
-                temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
-                del self.anchor_demon
-                self.anchor_demon = temp_anchor_demon
+                temp_anchor_denom = torch.cat([self.anchor_denom, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+                del self.anchor_denom
+                self.anchor_denom = temp_anchor_denom
 
                 temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
                 del self.opacity_accum
@@ -942,8 +947,8 @@ class GaussianModel:
 
         if require_purning:
             # # prune anchors
-            prune_mask = (self.opacity_accum < min_opacity * self.anchor_demon).squeeze(dim=1)
-            anchors_mask = (self.anchor_demon > check_interval * success_threshold).squeeze(dim=1)  # [N, 1]
+            prune_mask = (self.opacity_accum < min_opacity * self.anchor_denom).squeeze(dim=1)
+            anchors_mask = (self.anchor_denom > check_interval * success_threshold).squeeze(dim=1)  # [N, 1]
             prune_mask = torch.logical_and(prune_mask, anchors_mask)  # [N] 
 
             # update offset_denom
@@ -960,15 +965,15 @@ class GaussianModel:
             # update opacity accum
             if anchors_mask.sum() > 0:
                 self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
-                self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+                self.anchor_denom[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
 
             temp_opacity_accum = self.opacity_accum[~prune_mask]
             del self.opacity_accum
             self.opacity_accum = temp_opacity_accum
 
-            temp_anchor_demon = self.anchor_demon[~prune_mask]
-            del self.anchor_demon
-            self.anchor_demon = temp_anchor_demon
+            temp_anchor_denom = self.anchor_denom[~prune_mask]
+            del self.anchor_denom
+            self.anchor_denom = temp_anchor_denom
 
             if prune_mask.shape[0] > 0:
                 self.prune_anchor(prune_mask)
@@ -1036,9 +1041,9 @@ class GaussianModel:
         }
         
 
-        temp_anchor_demon = torch.cat([self.anchor_demon, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
-        del self.anchor_demon
-        self.anchor_demon = temp_anchor_demon
+        temp_anchor_denom = torch.cat([self.anchor_denom, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
+        del self.anchor_denom
+        self.anchor_denom = temp_anchor_denom
 
         temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
         del self.opacity_accum
@@ -1055,10 +1060,10 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
 
         # update offset_denom
-        padding_offset_demon = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
+        padding_offset_denom = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_denom.shape[0], 1],
                                            dtype=torch.int32, 
                                            device=self.offset_denom.device)
-        self.offset_denom = torch.cat([self.offset_denom, padding_offset_demon], dim=0)
+        self.offset_denom = torch.cat([self.offset_denom, padding_offset_denom], dim=0)
 
         padding_offset_gradient_accum = torch.zeros([self.get_anchor.shape[0]*self.n_offsets - self.offset_gradient_accum.shape[0], 1],
                                            dtype=torch.int32, 
